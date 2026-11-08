@@ -2,6 +2,7 @@ mod app;
 mod book;
 mod covers;
 mod library;
+mod pdf;
 
 use eframe::egui;
 

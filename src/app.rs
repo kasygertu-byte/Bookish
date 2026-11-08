@@ -1,6 +1,7 @@
 use crate::book::{self, Chapter};
 use crate::covers::{self, CoverRequest, CoverResult};
 use crate::library::{self, Library};
+use crate::pdf::PdfDocument;
 use eframe::egui::{self, Color32, FontId, Sense, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ pub struct BookshelfApp {
     fetching: HashSet<u64>,
     search: String,
     reader: Option<Reader>,
+    pdf_reader: Option<PdfReader>,
     /// Message shown at the bottom of the library (errors, import results).
     status: Option<String>,
 }
@@ -38,6 +40,20 @@ struct Reader {
     layout_key: Option<(usize, u32, u32, u32)>,
     /// Where to land once the current chapter has been paginated.
     target: Target,
+}
+
+/// Reader state for a PDF: pages are shown as rendered images.
+struct PdfReader {
+    book_id: u64,
+    title: String,
+    doc: PdfDocument,
+    page: usize,
+    /// Fit the page width to the window (scrolls vertically) instead of the whole page.
+    fit_width: bool,
+    /// Rendered pages near the current one: (texture, rendered width in pixels).
+    textures: HashMap<usize, (TextureHandle, u32)>,
+    /// Render requests that haven't come back yet: (page, width in pixels).
+    requested: HashSet<(usize, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +87,7 @@ impl BookshelfApp {
             fetching: HashSet::new(),
             search: String::new(),
             reader: None,
+            pdf_reader: None,
             status: None,
         };
         // Look up covers for books that don't have one yet.
@@ -168,10 +185,39 @@ impl BookshelfApp {
         self.status = Some(msg);
     }
 
-    fn open_book(&mut self, book_id: u64) {
+    fn open_book(&mut self, ctx: &egui::Context, book_id: u64) {
         let Some(book) = self.library.get(book_id) else {
             return;
         };
+        if book::is_pdf(&book.path) {
+            match PdfDocument::open(&book.path, ctx.clone()) {
+                Ok(doc) => {
+                    let page = book
+                        .progress
+                        .as_ref()
+                        .map(|p| p.offset.min(doc.page_count() - 1))
+                        .unwrap_or(0);
+                    doc.set_current(page);
+                    self.pdf_reader = Some(PdfReader {
+                        book_id,
+                        title: book.title.clone(),
+                        doc,
+                        page,
+                        fit_width: false,
+                        textures: HashMap::new(),
+                        requested: HashSet::new(),
+                    });
+                    if let Some(book) = self.library.get_mut(book_id) {
+                        book.last_opened = Some(library::now());
+                    }
+                    self.library.save();
+                }
+                Err(e) => {
+                    self.status = Some(format!("Could not open \"{}\": {e}", book.title));
+                }
+            }
+            return;
+        }
         match book::load_chapters(&book.path) {
             Ok(chapters) => {
                 let (chapter, offset) = book
@@ -202,6 +248,20 @@ impl BookshelfApp {
 
     /// Stores the reader's current position in the library and writes it to disk.
     fn save_progress(&mut self) {
+        if let Some(pdf) = &self.pdf_reader {
+            // For PDFs the position is the page number (stored in `offset`).
+            let count = pdf.doc.page_count();
+            let progress = library::Progress {
+                chapter: 0,
+                offset: pdf.page,
+                percent: (pdf.page + 1) as f32 / count as f32,
+            };
+            if let Some(book) = self.library.get_mut(pdf.book_id) {
+                book.progress = Some(progress);
+            }
+            self.library.save();
+            return;
+        }
         let Some(reader) = &self.reader else {
             return;
         };
@@ -257,7 +317,7 @@ impl BookshelfApp {
                         ui.close();
                         picked = rfd::FileDialog::new()
                             .set_title("Add books")
-                            .add_filter("E-books", &["epub", "EPUB", "txt", "TXT"])
+                            .add_filter("E-books", &["epub", "EPUB", "pdf", "PDF", "txt", "TXT"])
                             .pick_files();
                     }
                     if ui.button("Folder…").clicked() {
@@ -309,7 +369,7 @@ impl BookshelfApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.library.books.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("No books yet. Click \"+ Add books\" or drop EPUB / TXT files here.");
+                    ui.label("No books yet. Click \"+ Add books\" or drop EPUB / PDF / TXT files here.");
                 });
                 return;
             }
@@ -352,7 +412,7 @@ impl BookshelfApp {
                 });
 
             match action {
-                Some(CardAction::Open(id)) => self.open_book(id),
+                Some(CardAction::Open(id)) => self.open_book(&ctx, id),
                 Some(CardAction::FetchCover(id)) => self.request_cover(id),
                 Some(CardAction::Remove(id)) => {
                     self.cover_textures.remove(&id);
@@ -563,46 +623,11 @@ impl BookshelfApp {
             let area = ui.available_rect_before_wrap();
             let response = ui.allocate_rect(area, Sense::click());
 
-            // Keyboard, mouse wheel and click navigation.
-            let (next, prev, escape, scroll) = ui.input(|i| {
-                (
-                    i.key_pressed(egui::Key::ArrowRight)
-                        || i.key_pressed(egui::Key::PageDown)
-                        || i.key_pressed(egui::Key::Space)
-                        || i.key_pressed(egui::Key::ArrowDown),
-                    i.key_pressed(egui::Key::ArrowLeft)
-                        || i.key_pressed(egui::Key::PageUp)
-                        || i.key_pressed(egui::Key::ArrowUp),
-                    i.key_pressed(egui::Key::Escape),
-                    // Raw wheel events (not smoothed), so one notch turns one page.
-                    i.raw
-                        .events
-                        .iter()
-                        .filter_map(|e| match e {
-                            egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-                            _ => None,
-                        })
-                        .sum::<f32>(),
-                )
-            });
-            let hovered = response.hovered();
-            if next || (hovered && scroll < 0.0) {
-                next_page(reader);
-            }
-            if prev || (hovered && scroll > 0.0) {
-                prev_page(reader);
-            }
-            if escape {
-                close = true;
-            }
-            if response.clicked()
-                && let Some(pos) = response.interact_pointer_pos()
-            {
-                if pos.x > area.left() + area.width() * 0.6 {
-                    next_page(reader);
-                } else if pos.x < area.left() + area.width() * 0.4 {
-                    prev_page(reader);
-                }
+            match page_turn_input(ui, &response, area, true) {
+                PageTurn::Next => next_page(reader),
+                PageTurn::Prev => prev_page(reader),
+                PageTurn::Close => close = true,
+                PageTurn::None => {}
             }
 
             // Text column, centered, with margins.
@@ -664,12 +689,213 @@ impl BookshelfApp {
             self.reader = None;
         }
     }
+
+    // ---------------------------------------------------------------- PDF reader page
+
+    fn pdf_reader_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut close = false;
+        let Some(r) = &mut self.pdf_reader else {
+            return;
+        };
+        let before = r.page;
+        let count = r.doc.page_count();
+
+        // Pick up pages the background thread has finished rendering.
+        let rendered: Vec<_> = r.doc.rx.try_iter().collect();
+        for done in rendered {
+            r.requested.remove(&(done.page, done.width_px));
+            let tex = ctx.load_texture(
+                format!("pdf-page-{}", done.page),
+                done.image,
+                TextureOptions::LINEAR,
+            );
+            r.textures.insert(done.page, (tex, done.width_px));
+        }
+
+        egui::Panel::top("pdf_top").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("⬅ Library").clicked() {
+                    close = true;
+                }
+                ui.add_space(8.0);
+                let label = if r.fit_width { "Fit page" } else { "Fit width" };
+                if ui.button(label).clicked() {
+                    r.fit_width = !r.fit_width;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(&r.title).strong()).truncate());
+                });
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::Panel::bottom("pdf_bottom").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("◀").clicked() && r.page > 0 {
+                    r.page -= 1;
+                }
+                ui.label("Page");
+                let mut shown = r.page + 1;
+                ui.add(egui::DragValue::new(&mut shown).range(1..=count));
+                r.page = shown.clamp(1, count) - 1;
+                ui.label(format!("of {count}"));
+                if ui.button("▶").clicked() && r.page + 1 < count {
+                    r.page += 1;
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            let area = ui.available_rect_before_wrap();
+            let margin = 12.0;
+            let (pw, ph) = r.doc.page_sizes[r.page];
+            let avail_w = (area.width() - 2.0 * margin).max(50.0);
+            let avail_h = (area.height() - 2.0 * margin).max(50.0);
+            let scale = if r.fit_width {
+                avail_w / pw.max(1.0)
+            } else {
+                (avail_w / pw.max(1.0)).min(avail_h / ph.max(1.0))
+            };
+            let size = Vec2::new(pw * scale, ph * scale);
+
+            // Render at screen resolution, rounded so small resizes don't re-render.
+            let ppp = ctx.pixels_per_point();
+            let want_px = (((size.x * ppp) / 64.0).ceil() as u32).max(1) * 64;
+            r.doc.set_current(r.page);
+            for p in [r.page, r.page + 1, r.page.wrapping_sub(1)] {
+                if p >= count {
+                    continue;
+                }
+                let up_to_date = r.textures.get(&p).is_some_and(|(_, w)| *w == want_px);
+                if !up_to_date && r.requested.insert((p, want_px)) {
+                    r.doc.request(p, want_px);
+                }
+            }
+            // Free textures of pages far from the current one.
+            let page = r.page;
+            r.textures.retain(|&p, _| p + 2 >= page && p <= page + 2);
+
+            let paint = |ui: &mut egui::Ui, rect: egui::Rect| match r.textures.get(&page) {
+                Some((tex, _)) => {
+                    egui::Image::new(tex).paint_at(ui, rect);
+                }
+                None => {
+                    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+                    let spinner = egui::Rect::from_center_size(rect.center(), Vec2::splat(32.0));
+                    egui::Spinner::new()
+                        .color(Color32::GRAY)
+                        .paint_at(ui, spinner);
+                }
+            };
+
+            let turn = if r.fit_width {
+                // Tall page: scroll vertically; the wheel scrolls instead of turning pages.
+                let mut turn = PageTurn::None;
+                egui::ScrollArea::vertical()
+                    .id_salt(("pdf_scroll", page))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(margin);
+                        let (row, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), size.y),
+                            Sense::click(),
+                        );
+                        let rect = egui::Rect::from_center_size(row.center(), size);
+                        paint(ui, rect);
+                        ui.add_space(margin);
+                        turn = page_turn_input(ui, &response, area, false);
+                    });
+                turn
+            } else {
+                let response = ui.allocate_rect(area, Sense::click());
+                let rect = egui::Rect::from_center_size(area.center(), size);
+                paint(ui, rect);
+                page_turn_input(ui, &response, area, true)
+            };
+            match turn {
+                PageTurn::Next if r.page + 1 < count => r.page += 1,
+                PageTurn::Prev if r.page > 0 => r.page -= 1,
+                PageTurn::Close => close = true,
+                _ => {}
+            }
+        });
+
+        if r.page != before {
+            self.save_progress();
+        }
+        if close {
+            self.save_progress();
+            self.pdf_reader = None;
+        }
+    }
 }
 
 enum CardAction {
     Open(u64),
     FetchCover(u64),
     Remove(u64),
+}
+
+enum PageTurn {
+    None,
+    Next,
+    Prev,
+    Close,
+}
+
+/// Page-turn input shared by both readers: keys, mouse wheel (if `wheel`) and clicks on the
+/// right / left part of `area`.
+fn page_turn_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    area: egui::Rect,
+    wheel: bool,
+) -> PageTurn {
+    let (next, prev, escape, scroll) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowRight)
+                || i.key_pressed(egui::Key::PageDown)
+                || i.key_pressed(egui::Key::Space)
+                || i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::ArrowLeft)
+                || i.key_pressed(egui::Key::PageUp)
+                || i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::Escape),
+            // Raw wheel events (not smoothed), so one notch turns one page.
+            i.raw
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                    _ => None,
+                })
+                .sum::<f32>(),
+        )
+    });
+    let hovered = wheel && response.hovered();
+    if escape {
+        return PageTurn::Close;
+    }
+    if next || (hovered && scroll < 0.0) {
+        return PageTurn::Next;
+    }
+    if prev || (hovered && scroll > 0.0) {
+        return PageTurn::Prev;
+    }
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        if pos.x > area.left() + area.width() * 0.6 {
+            return PageTurn::Next;
+        } else if pos.x < area.left() + area.width() * 0.4 {
+            return PageTurn::Prev;
+        }
+    }
+    PageTurn::None
 }
 
 fn next_page(reader: &mut Reader) {
@@ -770,7 +996,9 @@ impl eframe::App for BookshelfApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.reader.is_some() {
+        if self.pdf_reader.is_some() {
+            self.pdf_reader_page(ui);
+        } else if self.reader.is_some() {
             self.reader_page(ui);
         } else {
             self.library_page(ui);

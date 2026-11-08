@@ -8,6 +8,7 @@ description = "Bookshelf: a small e-book library and reader (EPUB, TXT) with aut
 dirs = "6"
 eframe = "0.37"
 epub = "2.1"
+hayro = "0.9"
 html2text = { version = "0.17", features = ["xml"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.18"

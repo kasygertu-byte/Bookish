@@ -1,5 +1,6 @@
 //! Reading book files: metadata for the library, and the text content for the reader.
-//! Supported formats: EPUB and plain text (.txt).
+//! Supported formats: EPUB, plain text (.txt) and PDF (PDFs are shown as rendered pages,
+//! see `pdf.rs`; only their metadata is read here).
 
 use std::path::Path;
 
@@ -14,7 +15,11 @@ pub struct Metadata {
 }
 
 pub fn is_supported(path: &Path) -> bool {
-    matches!(extension(path).as_str(), "epub" | "txt")
+    matches!(extension(path).as_str(), "epub" | "txt" | "pdf")
+}
+
+pub fn is_pdf(path: &Path) -> bool {
+    extension(path) == "pdf"
 }
 
 fn extension(path: &Path) -> String {
@@ -45,6 +50,17 @@ pub fn read_metadata(path: &Path) -> Result<Metadata, String> {
             Ok(Metadata {
                 title: title.trim().to_string(),
                 author: author.trim().to_string(),
+            })
+        }
+        "pdf" => {
+            let (title, author) = crate::pdf::read_info(path)?;
+            Ok(Metadata {
+                title: if title.is_empty() {
+                    file_stem(path)
+                } else {
+                    title
+                },
+                author,
             })
         }
         "txt" => {

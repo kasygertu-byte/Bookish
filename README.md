@@ -23,6 +23,12 @@ library + viewer.
 - **Remembers where you stopped**: the position is saved on every page turn. It's stored as
   a character position in the chapter, so it stays right when you resize the window or
   change the text size
+- **PDF reader**: PDFs are shown as their real pages (layout, images and fonts intact),
+  rendered in the background at screen resolution, with the next page prepared ahead
+  - Same page-turn keys, mouse wheel and clicks as the text reader
+  - **Fit width** / **Fit page** toggle (in Fit width, the wheel scrolls the page instead)
+  - Page number box in the bottom bar to jump to any page
+  - The last page you were on is saved the same way
 - Light / dark theme
 
 ## Supported formats
@@ -30,6 +36,7 @@ library + viewer.
 | Format | Notes |
 |---|---|
 | EPUB | Title, author and chapter names from the book's metadata and table of contents. Text only (images and styling are not shown) |
+| PDF  | Shown as rendered pages (pure Rust renderer, [hayro](https://github.com/LaurenzV/hayro), no system libraries needed). Title and author from the PDF's document info, else the file name. Password-protected PDFs are not supported |
 | TXT  | UTF-8. A file named `Author - Title.txt` gets that author and title. Hard-wrapped text (e.g. Project Gutenberg) is re-flowed to the window width. Long files are split into parts |
 
 ## Build and run
